@@ -1001,8 +1001,22 @@ impl Whopper {
         );
 
         let fibers = &mut self.context.fibers;
-        // Run all active statements to completion
+        // Run all active statements to completion. Some statements (e.g. a
+        // COMMIT yielding on `pager_commit_lock`) can only finish after a
+        // sibling fiber's in-flight transaction releases its resources — but
+        // that sibling's BEGIN already returned Done, so it has no statement
+        // for this loop to step. To break that deadlock, bound the number of
+        // consecutive iterations that make zero terminal progress (no fiber
+        // transitions to Done/Busy/Err). When the budget runs out, fall
+        // through to the connection-close path below: `Connection::close`
+        // calls `rollback_tx` for every in-flight MVCC tx, which releases
+        // `pager_commit_lock` and any other per-tx locks. The simulator stays
+        // deterministic — the budget is exhausted by the same fiber/state on
+        // every replay of a given seed.
+        const REOPEN_STALL_BUDGET: usize = 1024;
+        let mut iterations_without_progress = 0usize;
         while fibers.iter().any(|f| f.statement.borrow().is_some()) {
+            let mut made_terminal_progress = false;
             for (fiber_idx, fiber) in fibers.iter_mut().enumerate() {
                 if fiber.statement.borrow().is_some() {
                     let done = {
@@ -1052,10 +1066,24 @@ impl Whopper {
                             .reset()
                             .expect("statement reset should succeed before restart");
                         fiber.rows.clear();
+                        made_terminal_progress = true;
                     }
                 }
             }
             self.io.step().unwrap();
+            if made_terminal_progress {
+                iterations_without_progress = 0;
+            } else {
+                iterations_without_progress += 1;
+                if iterations_without_progress >= REOPEN_STALL_BUDGET {
+                    debug!(
+                        "reopen: stall budget exhausted after {iterations_without_progress} \
+                         iterations with no terminal fiber progress; \
+                         falling through to connection close for forced rollback"
+                    );
+                    break;
+                }
+            }
         }
 
         // Close and drop all fiber connections to release database Arc references
